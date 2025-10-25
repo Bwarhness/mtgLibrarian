@@ -1,0 +1,99 @@
+name: Deploy to Unraid Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg SUPABASE_URL="${{ secrets.SUPABASE_URL }}" \
+            --build-arg SUPABASE_ANON_KEY="${{ secrets.SUPABASE_ANON_KEY }}" \
+            -t mtg-librarian:latest \
+            --load \
+            .
+
+      - name: Save Docker image
+        run: |
+          docker save mtg-librarian:latest | gzip > mtg-librarian.tar.gz
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Transfer image to server
+        run: |
+          scp mtg-librarian.tar.gz ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
+
+      - name: Deploy on server
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            # Load the Docker image
+            docker load < /tmp/mtg-librarian.tar.gz
+
+            # Stop and remove old container if it exists
+            docker stop mtg-librarian 2>/dev/null || true
+            docker rm mtg-librarian 2>/dev/null || true
+
+            # Start new container
+            docker run -d --name mtg-librarian \
+              --restart unless-stopped \
+              -p 8081:80 \
+              mtg-librarian:latest
+
+            # Wait for container to start
+            sleep 5
+
+            # Check if container is running
+            if docker ps | grep -q mtg-librarian; then
+              echo "✓ Container started successfully"
+            else
+              echo "✗ Container failed to start"
+              docker logs mtg-librarian
+              exit 1
+            fi
+
+            # Clean up
+            rm /tmp/mtg-librarian.tar.gz
+          EOF
+
+      - name: Verify deployment
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            # Test health endpoint
+            sleep 3
+            if curl -f http://localhost:8081/ > /dev/null 2>&1; then
+              echo "✓ Health check passed"
+              echo "✓ Deployment successful!"
+            else
+              echo "✗ Health check failed"
+              exit 1
+            fi
+          EOF
+
+      - name: Cleanup local artifacts
+        if: always()
+        run: |
+          rm -f mtg-librarian.tar.gz
+          rm -f ~/.ssh/id_rsa
